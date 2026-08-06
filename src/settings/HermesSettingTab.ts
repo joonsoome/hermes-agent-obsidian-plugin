@@ -15,9 +15,41 @@ export class HermesSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Connection")
       .setDesc(
-        "Connects to the local Hermes gateway on 127.0.0.1:8642 by default. Start the gateway first: launch Hermes Desktop (it auto-starts the gateway), or on a CLI/TUI install run `hermes gateway`. The plugin works with either — it only needs the gateway's HTTP API reachable."
+        "Default: the same-origin /hermes relay. It keeps Cloudflare Access and the gateway credential on the server."
       )
       .setHeading();
+
+    new Setting(containerEl)
+      .setName("Gateway address")
+      .setDesc(
+        "Use /hermes for the recommended relay, or a direct URL such as http://192.168.0.113:8642. A direct URL in Ignis uses its server-side proxy."
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("/hermes")
+          .setValue(this.plugin.settings.baseUrl)
+          .onChange(async (v) => {
+            this.plugin.settings.baseUrl = v.trim() || "/hermes";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Hermes API key")
+      .setDesc(
+        "Required only for a direct gateway URL. Leave blank for /hermes, where Nginx injects it. Ignis stores plugin settings as plaintext, so prefer /hermes when possible."
+      )
+      .addText((text) => {
+        text
+          .setPlaceholder("(not needed for /hermes)")
+          .setValue(this.plugin.settings.apiKey)
+          .onChange(async (v) => {
+            this.plugin.settings.apiKey = v.trim();
+            await this.plugin.saveSettings();
+          });
+        text.inputEl.type = "password";
+        return text;
+      });
 
     new Setting(containerEl)
       .setName("Your name")
@@ -31,36 +63,6 @@ export class HermesSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
-
-    new Setting(containerEl)
-      .setName("Gateway base URL")
-      .setDesc("Default profile uses http://127.0.0.1:8642. A trailing /v1 is stripped automatically.")
-      .addText((text) =>
-        text
-          .setPlaceholder("http://127.0.0.1:8642")
-          .setValue(this.plugin.settings.baseUrl)
-          .onChange(async (v) => {
-            this.plugin.settings.baseUrl = v;
-            await this.plugin.saveSettings();
-            this.plugin.reloadModelInViews();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("API key (API_SERVER_KEY)")
-      .setDesc("Paste the API_SERVER_KEY from ~/.hermes/.env. Required for session continuity and auth.")
-      .addText((text) => {
-        text
-          .setPlaceholder("paste API_SERVER_KEY")
-          .setValue(this.plugin.settings.apiKey)
-          .onChange(async (v) => {
-            this.plugin.settings.apiKey = v.trim();
-            await this.plugin.saveSettings();
-            this.plugin.reloadModelInViews();
-          });
-        text.inputEl.type = "password";
-        return text;
-      });
 
     new Setting(containerEl)
       .setName("Model")

@@ -3,9 +3,9 @@
 export type TransportPreference = "auto" | "runs" | "chat";
 
 export interface HermesSettings {
-  /** Base URL of the local Hermes gateway. Default profile pins port 8642. */
+  /** Same-origin Hermes relay, or an explicitly configured gateway URL. */
   baseUrl: string;
-  /** API_SERVER_KEY from ~/.hermes/.env, pasted by the user (decision D1). */
+  /** Optional bearer key for a direct gateway URL. Leave empty for /hermes. */
   apiKey: string;
   /** Model id (e.g. "gpt-5.5"). Empty -> the gateway's "hermes-agent" default. */
   model: string;
@@ -73,7 +73,7 @@ export interface HermesSettings {
 }
 
 export const DEFAULT_SETTINGS: HermesSettings = {
-  baseUrl: "http://127.0.0.1:8642",
+  baseUrl: "/hermes",
   apiKey: "",
   model: "",
   transport: "auto",

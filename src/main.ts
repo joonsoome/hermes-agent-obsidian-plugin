@@ -1,7 +1,11 @@
 import { FileSystemAdapter, MarkdownView, Notice, Plugin, WorkspaceLeaf, normalizePath } from "obsidian";
+// Ignis provides browser-backed shims for these modules so vault metadata and
+// graph cache behavior stay identical to the desktop plugin.
+/* eslint-disable import/no-nodejs-modules */
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+/* eslint-enable import/no-nodejs-modules */
 import { DEFAULT_SETTINGS, HermesSettings } from "./settings/types";
 import { HermesSettingTab } from "./settings/HermesSettingTab";
 import { HermesView, VIEW_TYPE_HERMES } from "./view/HermesView";
@@ -163,7 +167,8 @@ export default class HermesPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const data = (await this.loadData()) as Partial<HermesSettings> | null;
+    const data = (await this.loadData()) as (Partial<HermesSettings> & { apiKey?: unknown }) | null;
+    if (data && typeof data.apiKey !== "undefined" && typeof data.apiKey !== "string") delete data.apiKey;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
   }
 
@@ -328,6 +333,8 @@ export default class HermesPlugin extends Plugin {
     const out: string[] = [];
     const configured = (this.settings.hermesHome || "").trim();
     if (configured) out.push(configured);
+    // Ignis may not expose process.env; keep the desktop compatibility path.
+    // eslint-disable-next-line no-undef
     const env = (process.env.HERMES_HOME || process.env.HERMES_CONFIG_DIR || "").trim();
     if (env) out.push(env);
     try {
@@ -375,7 +382,7 @@ export default class HermesPlugin extends Plugin {
     }
   }
 
-  /** Re-resolve the active model (after a model/URL/key change) in open views. */
+  /** Re-resolve the active model after a model or relay URL change. */
   reloadModelInViews(): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_HERMES)) {
       const view = leaf.view;

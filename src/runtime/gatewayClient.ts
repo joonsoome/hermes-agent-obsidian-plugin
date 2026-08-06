@@ -11,14 +11,9 @@
 //   [Chat]  POST /v1/chat/completions     -> OpenAI-compatible SSE
 //   GET  /v1/models                       -> model list (test/connect)
 //
-// Auth: Authorization: Bearer <API_SERVER_KEY>. We talk to it from the Node
-// side (Electron renderer with Node integration), exactly as Desktop does, so
-// there is no browser CORS involved and Node's http client ignores the system
-// proxy for loopback addresses.
-
-import * as http from "http";
-import * as https from "https";
-import { randomUUID } from "crypto";
+// Ignis runs Obsidian in a browser, where Node's http.request is intentionally
+// unavailable. Requests therefore use same-origin browser fetch; Nginx owns
+// the Hermes API credential and relays /hermes/* to the gateway.
 import { HermesSettings } from "../settings/types";
 import {
   HermesCapabilities,
@@ -68,7 +63,193 @@ export interface TestResult {
 interface RawResponse {
   status: number;
   body: string;
-  headers: http.IncomingHttpHeaders;
+  headers: Record<string, string>;
+}
+
+type EventHandler = (...args: unknown[]) => void;
+
+type IgnisWindow = Window & {
+  /** Native fetch retained by Ignis before its cross-origin proxy shim. */
+  __originalFetch?: typeof window.fetch;
+};
+
+interface BrowserRequestOptions {
+  method?: string;
+  headers?: Record<string, string>;
+  timeout?: number;
+}
+
+class BrowserResponse {
+  private listeners = new Map<string, EventHandler[]>();
+
+  constructor(
+    readonly statusCode: number,
+    readonly headers: Record<string, string>
+  ) {}
+
+  on(event: string, handler: EventHandler): this {
+    const handlers = this.listeners.get(event) || [];
+    handlers.push(handler);
+    this.listeners.set(event, handlers);
+    return this;
+  }
+
+  emit(event: string, ...args: unknown[]): void {
+    for (const handler of this.listeners.get(event) || []) handler(...args);
+  }
+}
+
+/** Small Node-request-shaped adapter so the protocol code below stays shared. */
+class BrowserRequest {
+  private readonly controller = new AbortController();
+  private readonly listeners = new Map<string, EventHandler[]>();
+  private readonly chunks: string[] = [];
+  private timer: number | null = null;
+  private started = false;
+
+  constructor(
+    private readonly url: string,
+    private readonly options: BrowserRequestOptions,
+    private readonly onResponse?: (response: BrowserResponse) => void
+  ) {}
+
+  on(event: string, handler: EventHandler): this {
+    const handlers = this.listeners.get(event) || [];
+    handlers.push(handler);
+    this.listeners.set(event, handlers);
+    return this;
+  }
+
+  write(chunk: unknown): void {
+    if (typeof chunk === "string") this.chunks.push(chunk);
+  }
+
+  end(chunk?: unknown): void {
+    if (chunk != null) this.write(chunk);
+    if (this.started) return;
+    this.started = true;
+    void this.start();
+  }
+
+  destroy(error?: Error): void {
+    if (this.timer !== null) window.clearTimeout(this.timer);
+    this.controller.abort();
+    if (error) this.emit("error", error);
+  }
+
+  private emit(event: string, ...args: unknown[]): void {
+    for (const handler of this.listeners.get(event) || []) handler(...args);
+  }
+
+  private async start(): Promise<void> {
+    if (this.options.timeout && this.options.timeout > 0) {
+      this.timer = window.setTimeout(() => {
+        this.emit("timeout");
+        this.controller.abort();
+      }, this.options.timeout);
+    }
+    try {
+      // Content-Length is a forbidden browser header. fetch determines it.
+      const headers = { ...(this.options.headers || {}) };
+      delete headers["Content-Length"];
+      delete headers["content-length"];
+      const response = await this.fetch(this.url, {
+        method: this.options.method || "GET",
+        headers,
+        body: this.chunks.length ? this.chunks.join("") : undefined,
+        credentials: "same-origin",
+        signal: this.controller.signal
+      });
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((value, name) => {
+        responseHeaders[name.toLowerCase()] = value;
+      });
+      const stream = new BrowserResponse(response.status, responseHeaders);
+      this.onResponse?.(stream);
+      if (!response.body) {
+        stream.emit("end");
+        return;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) stream.emit("data", decoder.decode(value, { stream: true }));
+      }
+      const tail = decoder.decode();
+      if (tail) stream.emit("data", tail);
+      stream.emit("end");
+    } catch (error) {
+      if ((error as { name?: string })?.name === "AbortError") return;
+      this.emit("error", error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      if (this.timer !== null) window.clearTimeout(this.timer);
+    }
+  }
+
+  /**
+   * Ignis's global fetch shim appends `Origin: app://obsidian.md` before it
+   * forwards cross-origin requests. Hermes rejects that synthetic Origin.
+   * Calling Ignis's same-origin proxy directly preserves Authorization while
+   * avoiding the injected header. Outside Ignis, use ordinary browser fetch.
+   */
+  private async fetch(url: string, init: RequestInit): Promise<Response> {
+    const ignis = window as IgnisWindow;
+    const nativeFetch = ignis.__originalFetch;
+    let isCrossOrigin = false;
+    try {
+      isCrossOrigin = new URL(url, window.location.href).origin !== window.location.origin;
+    } catch {
+      /* ordinary fetch will report an invalid URL */
+    }
+    if (!nativeFetch || !isCrossOrigin) return window.fetch(url, init);
+
+    const headers = new Headers(init.headers);
+    const proxyResponse = await nativeFetch("/api/proxy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({
+        url,
+        method: init.method || "GET",
+        headers: Object.fromEntries(headers.entries()),
+        body: typeof init.body === "string" ? init.body : null,
+        binary: false
+      })
+    });
+    if (!proxyResponse.ok) {
+      const error = await proxyResponse.text();
+      throw new Error(error || `Ignis proxy returned HTTP ${proxyResponse.status}`);
+    }
+    const proxied = (await proxyResponse.json()) as {
+      status: number;
+      headers?: Record<string, string>;
+      body?: string;
+    };
+    const encoded = proxied.body || "";
+    const binary = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+    return new Response(binary, { status: proxied.status, headers: proxied.headers });
+  }
+}
+
+const browserRequester = {
+  request: (url: string, options: BrowserRequestOptions, onResponse?: (response: BrowserResponse) => void) =>
+    new BrowserRequest(url, options, onResponse)
+};
+
+function newSessionId(): string {
+  const uuid = window.crypto?.randomUUID?.();
+  return `obs-${Date.now()}-${uuid || Math.random().toString(36).slice(2)}`;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.message === "aborted");
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === "string" ? error : "Unknown request error";
 }
 
 export class HermesGatewayClient {
@@ -103,12 +284,12 @@ export class HermesGatewayClient {
   }
 
   private authHeaders(): Record<string, string> {
-    const key = (this.getSettings().apiKey || "").trim();
-    return key ? { Authorization: `Bearer ${key}` } : {};
+    const apiKey = this.getSettings().apiKey.trim();
+    return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
   }
 
-  private requester(url: string): typeof http | typeof https {
-    return url.startsWith("https") ? https : http;
+  private requester(): typeof browserRequester {
+    return browserRequester;
   }
 
   /** One-shot (non-streaming) JSON request used for capabilities/models. */
@@ -119,16 +300,16 @@ export class HermesGatewayClient {
     timeoutMs = 8000
   ): Promise<RawResponse> {
     const url = `${this.base()}${path}`;
-    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf-8");
+    const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers: Record<string, string> = { ...this.authHeaders() };
     if (payload) {
       headers["Content-Type"] = "application/json";
-      headers["Content-Length"] = String(payload.length);
+      headers["Content-Length"] = String(new TextEncoder().encode(payload).byteLength);
     }
     return new Promise<RawResponse>((resolve, reject) => {
-      const req = this.requester(url).request(url, { method, headers, timeout: timeoutMs }, (res) => {
+      const req = this.requester().request(url, { method, headers, timeout: timeoutMs }, (res) => {
         let raw = "";
-        res.on("data", (c: Buffer) => (raw += c.toString()));
+        res.on("data", (c: string) => (raw += c));
         res.on("end", () =>
           resolve({ status: res.statusCode || 0, body: raw, headers: res.headers })
         );
@@ -215,25 +396,39 @@ export class HermesGatewayClient {
   /** Probe the gateway and report a user-readable connection status. */
   async testConnection(): Promise<TestResult> {
     try {
-      const caps = await this.getCapabilities(true);
-      const useRuns = supportsRunsTransport(caps);
-      let models: string[] = [];
-      try {
-        models = await this.listModels();
-      } catch {
-        /* models endpoint optional for the test */
-      }
-      if (caps === null && models.length === 0) {
+      const capabilityResponse = await this.jsonRequest("/v1/capabilities", "GET");
+      if (capabilityResponse.status !== 200) {
+        const detail = capabilityResponse.body.trim().replace(/\s+/g, " ").slice(0, 240);
         return {
           ok: false,
-          detail:
-            "Reached the host but got no capabilities/models. Is the Hermes gateway started and the API key correct?"
+          detail: `Gateway returned HTTP ${capabilityResponse.status} for /v1/capabilities${
+            detail ? `: ${detail}` : "."
+          }`
         };
+      }
+      let caps: HermesCapabilities;
+      try {
+        caps = JSON.parse(capabilityResponse.body) as HermesCapabilities;
+      } catch {
+        return {
+          ok: false,
+          detail: "Gateway returned HTTP 200 for /v1/capabilities, but the response was not valid JSON."
+        };
+      }
+      this.capsCache = { value: caps, expiresAt: Date.now() + 60000 };
+      const useRuns = supportsRunsTransport(caps);
+      let models: string[] = [];
+      let modelError = "";
+      try {
+        models = await this.listModels();
+      } catch (e) {
+        /* models endpoint optional for the test */
+        modelError = errorMessage(e);
       }
       return {
         ok: true,
         detail: `Connected. Transport: ${useRuns ? "runs" : "chat"}.${
-          models.length ? ` ${models.length} model(s) available.` : ""
+          models.length ? ` ${models.length} model(s) available.` : modelError ? ` /v1/models unavailable: ${modelError}` : ""
         }`,
         transport: useRuns ? "runs" : "chat",
         models
@@ -243,11 +438,11 @@ export class HermesGatewayClient {
       if (/ECONNREFUSED|timed out|ENOTFOUND|EHOSTUNREACH/i.test(msg)) {
         return {
           ok: false,
-          detail: `Cannot reach the gateway at ${this.base()}. Start the Hermes gateway, then retry: launch Hermes Desktop, or (CLI/TUI install) run \`hermes gateway\`. (${msg})`
+          detail: `Cannot reach the Hermes relay at ${this.base()}. Check the Ignis relay and Cloudflare Access session. (${msg})`
         };
       }
       if (/401|403/.test(msg)) {
-        return { ok: false, detail: `Authentication failed. Check the API key. (${msg})` };
+        return { ok: false, detail: `Authentication failed. Check the Cloudflare Access session. (${msg})` };
       }
       return { ok: false, detail: `Connection failed: ${msg}` };
     }
@@ -363,13 +558,13 @@ export class HermesGatewayClient {
     if (resumeSessionId) bodyObj.session_id = resumeSessionId;
     if (s.reasoningEffort) bodyObj.reasoning_effort = s.reasoningEffort;
 
-    const payload = Buffer.from(JSON.stringify(bodyObj), "utf-8");
+    const payload = JSON.stringify(bodyObj);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Content-Length": String(payload.length),
+      "Content-Length": String(new TextEncoder().encode(payload).byteLength),
       ...this.authHeaders()
     };
-    let sessionId = resumeSessionId || (headers.Authorization ? `obs-${Date.now()}-${randomUUID()}` : "");
+    let sessionId = resumeSessionId || newSessionId();
     if (sessionId) headers["X-Hermes-Session-Id"] = sessionId;
 
     const url = `${this.base()}/v1/chat/completions`;
@@ -397,7 +592,7 @@ export class HermesGatewayClient {
       return false;
     };
 
-    const req = this.requester(url).request(
+    const req = this.requester().request(
       url,
       { method: "POST", headers, timeout: s.requestTimeoutMs },
       (res) => {
@@ -406,7 +601,7 @@ export class HermesGatewayClient {
 
         if (res.statusCode !== 200) {
           let errBody = "";
-          res.on("data", (d: Buffer) => (errBody += d.toString()));
+          res.on("data", (d: string) => (errBody += d));
           res.on("end", () => {
             try {
               const err = JSON.parse(errBody) as { error?: { message?: unknown } };
@@ -420,8 +615,8 @@ export class HermesGatewayClient {
         }
 
         let buffer = "";
-        res.on("data", (chunk: Buffer) => {
-          buffer += chunk.toString();
+        res.on("data", (chunk: string) => {
+          buffer += chunk;
           const parts = buffer.split("\n\n");
           buffer = parts.pop() || "";
           for (const part of parts) {
@@ -441,15 +636,15 @@ export class HermesGatewayClient {
           finish(hasContent ? undefined : lastError || undefined, sessionId);
         });
         res.on("error", (err) => {
-          if (isAborted() || err.name === "AbortError" || err.message === "aborted") return;
-          finish(`Stream error: ${err.message}`);
+          if (isAborted() || isAbortError(err)) return;
+          finish(`Stream error: ${errorMessage(err)}`);
         });
       }
     );
     reqs.push(req);
     req.on("error", (err) => {
-      if (isAborted() || err.name === "AbortError") return;
-      finish(`API request failed: ${err.message}`);
+      if (isAborted() || isAbortError(err)) return;
+      finish(`API request failed: ${errorMessage(err)}`);
     });
     req.on("timeout", () => {
       req.destroy();
@@ -473,7 +668,7 @@ export class HermesGatewayClient {
     const s = this.getSettings();
     const apiUrl = this.base();
     const auth = this.authHeaders();
-    const sessionId = resumeSessionId || (auth.Authorization ? `obs-${Date.now()}-${randomUUID()}` : "");
+    const sessionId = resumeSessionId || newSessionId();
 
     const bodyObj: Record<string, unknown> = {
       model: s.model || "hermes-agent",
@@ -495,10 +690,10 @@ export class HermesGatewayClient {
     if (s.reasoningEffort) bodyObj.reasoning_effort = s.reasoningEffort;
     if (sessionId) bodyObj.session_id = sessionId;
 
-    const payload = Buffer.from(JSON.stringify(bodyObj), "utf-8");
+    const payload = JSON.stringify(bodyObj);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Content-Length": String(payload.length),
+      "Content-Length": String(new TextEncoder().encode(payload).byteLength),
       ...auth
     };
     if (sessionId) headers["X-Hermes-Session-Id"] = sessionId;
@@ -581,7 +776,7 @@ export class HermesGatewayClient {
 
     const openEventStream = (id: string) => {
       const eventsUrl = `${apiUrl}/v1/runs/${encodeURIComponent(id)}/events`;
-      const eventsReq = this.requester(eventsUrl).request(
+      const eventsReq = this.requester().request(
         eventsUrl,
         { method: "GET", headers: auth, timeout: s.requestTimeoutMs },
         (res) => {
@@ -590,8 +785,8 @@ export class HermesGatewayClient {
             return;
           }
           let buffer = "";
-          res.on("data", (chunk: Buffer) => {
-            buffer += chunk.toString();
+          res.on("data", (chunk: string) => {
+            buffer += chunk;
             const parts = buffer.split("\n\n");
             buffer = parts.pop() || "";
             for (const part of parts) {
@@ -621,9 +816,9 @@ export class HermesGatewayClient {
       );
       reqs.push(eventsReq);
       eventsReq.on("error", (err) => {
-        if (isAborted() || err.name === "AbortError") return;
+        if (isAborted() || isAbortError(err)) return;
         if (!hasContent) fallback();
-        else finish(`Run event stream failed: ${err.message}`);
+        else finish(`Run event stream failed: ${errorMessage(err)}`);
       });
       eventsReq.on("timeout", () => {
         eventsReq.destroy();
@@ -634,12 +829,12 @@ export class HermesGatewayClient {
     };
 
     const startUrl = `${apiUrl}/v1/runs`;
-    const startReq = this.requester(startUrl).request(
+    const startReq = this.requester().request(
       startUrl,
       { method: "POST", headers, timeout: 30000 },
       (res) => {
         let raw = "";
-        res.on("data", (c: Buffer) => (raw += c.toString()));
+        res.on("data", (c: string) => (raw += c));
         res.on("end", () => {
           if (res.statusCode !== 200 && res.statusCode !== 202) {
             fallback();
@@ -661,7 +856,7 @@ export class HermesGatewayClient {
     );
     reqs.push(startReq);
     startReq.on("error", (err) => {
-      if (isAborted() || err.name === "AbortError") return;
+      if (isAborted() || isAbortError(err)) return;
       fallback();
     });
     startReq.on("timeout", () => {
@@ -675,7 +870,7 @@ export class HermesGatewayClient {
   private postRunStop(apiUrl: string, runId: string): void {
     const url = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}/stop`;
     try {
-      const req = this.requester(url).request(url, { method: "POST", headers: this.authHeaders() });
+      const req = this.requester().request(url, { method: "POST", headers: this.authHeaders() });
       req.on("error", () => {});
       req.end();
     } catch {
@@ -691,13 +886,13 @@ export class HermesGatewayClient {
   ): void {
     const url = `${apiUrl}/v1/runs/${encodeURIComponent(runId)}/approval`;
     try {
-      const payload = Buffer.from(JSON.stringify({ choice, resolve_all: true }), "utf-8");
+      const payload = JSON.stringify({ choice, resolve_all: true });
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
-        "Content-Length": String(payload.length),
+        "Content-Length": String(new TextEncoder().encode(payload).byteLength),
         ...this.authHeaders()
       };
-      const req = this.requester(url).request(url, { method: "POST", headers });
+      const req = this.requester().request(url, { method: "POST", headers });
       req.on("error", () => {});
       req.write(payload);
       req.end();
