@@ -25,9 +25,7 @@ import {
   normaliseBaseUrl,
   parseSseBlock,
   runCompletedUsage,
-  runEventReasoningText,
-  supportsRunsTransport,
-  toolEventFromRunEvent
+  supportsRunsTransport
 } from "./protocol";
 import { buildSystemInstructions, resolveWorkingFolder } from "./context";
 
@@ -708,124 +706,96 @@ export class HermesGatewayClient {
       this.startChat(input, history, cb, resumeSessionId, reqs, isAborted, finish);
     };
 
-    const handleEvent = (raw: Record<string, unknown>) => {
-      const name = typeof raw.event === "string" ? raw.event : "";
-      if (name === "message.delta") {
-        const delta = typeof raw.delta === "string" ? raw.delta : "";
-        if (delta) {
-          hasContent = true;
-          cb.onChunk(delta);
-        }
-        return;
-      }
-      const reasoning = runEventReasoningText(raw);
-      if (reasoning) {
-        cb.onReasoning?.(reasoning);
-        return;
-      }
-      const toolEvent = toolEventFromRunEvent(raw);
-      if (toolEvent) {
-        cb.onToolEvent?.(toolEvent);
-        return;
-      }
-      if (name === "run.completed") {
-        const output = typeof raw.output === "string" ? raw.output : "";
-        if (output && !hasContent) {
-          hasContent = true;
-          cb.onChunk(output);
-        }
-        const usage = runCompletedUsage(raw);
-        if (usage) cb.onUsage?.(usage);
-        finish(undefined, sessionId);
-        return;
-      }
-      if (name === "run.failed") {
-        if (!hasContent) {
-          fallback();
-          return;
-        }
-        finish(typeof raw.error === "string" && raw.error ? raw.error : "Hermes run failed.");
-        return;
-      }
-      if (name === "run.cancelled") {
-        finish(hasContent ? undefined : "Hermes run was cancelled.", sessionId);
-        return;
-      }
-      if (name === "approval.request") {
-        // The agent is asking permission to use a tool (file read/write, search,
-        // terminal). Auto-approve so the vault really is its working directory;
-        // otherwise we'd deadlock or have to fall back to a tool-less reply.
-        if (this.getSettings().autoApproveTools !== false && runId) {
-          const command = typeof raw.command === "string" ? raw.command : "";
-          cb.onToolEvent?.({
-            name: "approval",
-            status: "completed",
-            preview: command ? `auto-approved: ${command}` : "auto-approved"
-          });
-          // Respond "always" + resolve_all so repeated identical requests don't
-          // re-prompt; keep listening on the existing event stream.
-          this.postRunApproval(apiUrl, runId, "always");
-          return;
-        }
-        // Manual mode: no approval UI, so cancel + fall back to a plain reply.
-        if (runId) this.postRunStop(apiUrl, runId);
-        fallback();
-        return;
-      }
-    };
+    // Ignis buffers an upstream SSE stream until it closes, so subscribing to
+    // /events leaves the browser waiting longer than its request timeout.
+    // The Gateway's run-status endpoint exposes terminal output, usage and
+    // approval state; short polling works through Ignis's ordinary proxy.
+    const pollRun = (id: string) => {
+      let timer: number | null = null;
+      let stopped = false;
+      let approvalSubmitted = false;
+      const stopPolling = () => {
+        stopped = true;
+        if (timer !== null) window.clearTimeout(timer);
+      };
+      reqs.push({ destroy: stopPolling });
 
-    const openEventStream = (id: string) => {
-      const eventsUrl = `${apiUrl}/v1/runs/${encodeURIComponent(id)}/events`;
-      const eventsReq = this.requester().request(
-        eventsUrl,
-        { method: "GET", headers: auth, timeout: s.requestTimeoutMs },
-        (res) => {
-          if (res.statusCode !== 200) {
-            fallback();
-            return;
-          }
-          let buffer = "";
-          res.on("data", (chunk: string) => {
-            buffer += chunk;
-            const parts = buffer.split("\n\n");
-            buffer = parts.pop() || "";
-            for (const part of parts) {
-              const parsed = parseSseBlock(part);
-              if (!parsed || !parsed.data || parsed.data.startsWith(":")) continue;
+      const scheduleNext = () => {
+        if (!stopped && !isAborted()) timer = window.setTimeout(poll, 1500);
+      };
+
+      const poll = () => {
+        if (stopped || isAborted()) return;
+        const statusUrl = `${apiUrl}/v1/runs/${encodeURIComponent(id)}`;
+        const statusReq = this.requester().request(
+          statusUrl,
+          { method: "GET", headers: auth, timeout: 10000 },
+          (res) => {
+            let raw = "";
+            res.on("data", (chunk: string) => (raw += chunk));
+            res.on("end", () => {
+              if (stopped || isAborted()) return;
+              if (res.statusCode !== 200) {
+                stopPolling();
+                finish(`Run status request returned ${res.statusCode}: ${raw.slice(0, 240)}`);
+                return;
+              }
+              let status: Record<string, unknown>;
               try {
-                handleEvent(JSON.parse(parsed.data) as Record<string, unknown>);
+                status = JSON.parse(raw) as Record<string, unknown>;
               } catch {
-                /* skip malformed event */
+                stopPolling();
+                finish("Gateway returned an invalid run status response.");
+                return;
               }
-            }
-          });
-          res.on("end", () => {
-            if (buffer.trim()) {
-              const parsed = parseSseBlock(buffer);
-              if (parsed?.data) {
-                try {
-                  handleEvent(JSON.parse(parsed.data) as Record<string, unknown>);
-                } catch {
-                  /* ignore */
+
+              const state = typeof status.status === "string" ? status.status : "";
+              if (state === "completed") {
+                stopPolling();
+                const output = typeof status.output === "string" ? status.output : "";
+                if (output && !hasContent) {
+                  hasContent = true;
+                  cb.onChunk(output);
                 }
+                const usage = runCompletedUsage({ event: "run.completed", usage: status.usage });
+                if (usage) cb.onUsage?.(usage);
+                finish(undefined, sessionId);
+                return;
               }
-            }
-            finish(hasContent ? undefined : undefined, sessionId);
-          });
-        }
-      );
-      reqs.push(eventsReq);
-      eventsReq.on("error", (err) => {
-        if (isAborted() || isAbortError(err)) return;
-        if (!hasContent) fallback();
-        else finish(`Run event stream failed: ${errorMessage(err)}`);
-      });
-      eventsReq.on("timeout", () => {
-        eventsReq.destroy();
-        if (!hasContent) fallback();
-        else finish("Run event stream timed out.");
-      });
-      eventsReq.end();
+              if (state === "failed") {
+                stopPolling();
+                finish(typeof status.error === "string" && status.error ? status.error : "Hermes run failed.");
+                return;
+              }
+              if (state === "cancelled") {
+                stopPolling();
+                finish("Hermes run was cancelled.", sessionId);
+                return;
+              }
+              if (state === "waiting_for_approval" && this.getSettings().autoApproveTools !== false && !approvalSubmitted) {
+                approvalSubmitted = true;
+                this.postRunApproval(apiUrl, id, "always");
+              }
+              scheduleNext();
+            });
+          }
+        );
+        reqs.push(statusReq);
+        statusReq.on("error", (err) => {
+          if (stopped || isAborted() || isAbortError(err)) return;
+          stopPolling();
+          finish(`Run status request failed: ${errorMessage(err)}`);
+        });
+        statusReq.on("timeout", () => {
+          statusReq.destroy();
+          if (stopped || isAborted()) return;
+          stopPolling();
+          finish("Run status request timed out.");
+        });
+        statusReq.end();
+      };
+
+      poll();
     };
 
     const startUrl = `${apiUrl}/v1/runs`;
@@ -850,7 +820,7 @@ export class HermesGatewayClient {
             fallback();
             return;
           }
-          openEventStream(runId);
+          pollRun(runId);
         });
       }
     );
