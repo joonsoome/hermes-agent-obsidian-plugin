@@ -9,7 +9,7 @@ import { HermesGraphView, VIEW_TYPE_HERMES_GRAPH } from "./view/HermesGraphView"
 import { HermesGatewayClient } from "./runtime/gatewayClient";
 import { SmartGraph } from "./runtime/graph";
 import { buildPrompt } from "./runtime/context";
-import { parseConfigModel, parseContextLengthCache } from "./runtime/protocol";
+import { parseConfigModel, parseContextLengthCache, sanitizeProfileName } from "./runtime/protocol";
 import {
   Conversation,
   parseHistoryFile,
@@ -325,17 +325,45 @@ export default class HermesPlugin extends Plugin {
    * `~/.hermes`. The gateway runs on this same machine, so these are readable.
    */
   private hermesHomeCandidates(): string[] {
-    const out: string[] = [];
+    const homes: string[] = [];
     const configured = (this.settings.hermesHome || "").trim();
-    if (configured) out.push(configured);
+    if (configured) homes.push(configured);
     const env = (process.env.HERMES_HOME || process.env.HERMES_CONFIG_DIR || "").trim();
-    if (env) out.push(env);
+    if (env) homes.push(env);
     try {
-      out.push(path.join(os.homedir(), ".hermes"));
+      homes.push(path.join(os.homedir(), ".hermes"));
     } catch {
       /* ignore */
     }
+    // Multi-profile installs keep the served config in profiles/<name>/config.yaml
+    // (the root config.yaml is then just a template), so the active profile dir
+    // must win over its parent home or the footer shows a stale model.
+    const out: string[] = [];
+    for (const home of homes) {
+      const profileDir = this.activeProfileDir(home);
+      if (profileDir) out.push(profileDir);
+      out.push(home);
+    }
     return out;
+  }
+
+  /**
+   * Resolve `<home>/profiles/<active>/config.yaml`'s directory when this home
+   * uses profiles (an `active_profile` marker file names the selected one).
+   * Returns "" when the home has no profiles — callers fall back to the home
+   * itself, preserving the pre-profile behavior.
+   */
+  private activeProfileDir(home: string): string {
+    try {
+      const marker = path.join(home, "active_profile");
+      if (!fs.existsSync(marker)) return "";
+      const name = sanitizeProfileName(fs.readFileSync(marker, "utf-8"));
+      if (!name) return "";
+      const dir = path.join(home, "profiles", name);
+      return fs.existsSync(path.join(dir, "config.yaml")) ? dir : "";
+    } catch {
+      return "";
+    }
   }
 
   /**

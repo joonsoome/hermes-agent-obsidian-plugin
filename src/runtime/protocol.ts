@@ -222,6 +222,19 @@ export function parseConfigModel(yamlText: string): { model?: string; provider?:
 }
 
 /**
+ * Sanitize the contents of a Hermes `active_profile` marker file into a safe
+ * profile directory name. Multi-profile installs record the selected profile
+ * here and keep its real config in `profiles/<name>/config.yaml`. Returns ""
+ * for empty values and anything that could escape the profiles directory
+ * (path separators, traversal, oversized names).
+ */
+export function sanitizeProfileName(raw: string): string {
+  const name = (raw || "").trim();
+  if (!name || name.length > 64) return "";
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.includes("..") ? name : "";
+}
+
+/**
  * Look up a model's context window from a Hermes `context_length_cache.yaml`.
  * Keys look like `gpt-5.5@https://.../codex: 272000`; we match on the bare model
  * id (the part before `@`). Returns undefined when not present.

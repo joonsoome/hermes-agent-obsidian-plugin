@@ -79,7 +79,7 @@ export class HermesSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Hermes home (for model name)")
       .setDesc(
-        "Folder containing config.yaml, used to show the real model (e.g. gpt-5.5) and its context window — the gateway API only reports \"hermes-agent\". Leave empty to auto-detect ($HERMES_HOME, then ~/.hermes). Portable build: point this at the hermes-data/hermes folder next to the exe."
+        "Folder containing config.yaml, used to show the real model (e.g. gpt-5.5) and its context window — the gateway API only reports \"hermes-agent\". Leave empty to auto-detect ($HERMES_HOME, then ~/.hermes). Portable build: point this at the hermes-data/hermes folder next to the exe. Multi-profile installs are detected automatically (the active profile's config.yaml wins); you can also point directly at a profiles/<name> folder."
       )
       .addText((text) =>
         text

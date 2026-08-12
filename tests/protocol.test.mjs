@@ -20,7 +20,8 @@ import {
   contextPercent,
   greetingOptions,
   parseConfigModel,
-  parseContextLengthCache
+  parseContextLengthCache,
+  sanitizeProfileName
 } from "./.build/protocol.mjs";
 
 test("parseSseBlock parses data-only blocks with CRLF", () => {
@@ -193,4 +194,21 @@ test("greetingOptions personalizes when a name is set", () => {
   const anon = greetingOptions("");
   assert.ok(anon.includes("What's new?"));
   assert.ok(anon.includes("How can I help you today?"));
+});
+
+test("sanitizeProfileName accepts plain profile names", () => {
+  assert.equal(sanitizeProfileName("planner"), "planner");
+  assert.equal(sanitizeProfileName("  my-profile.2 \n"), "my-profile.2");
+  assert.equal(sanitizeProfileName("A_b-c.d"), "A_b-c.d");
+});
+
+test("sanitizeProfileName rejects traversal, separators, and junk", () => {
+  assert.equal(sanitizeProfileName(""), "");
+  assert.equal(sanitizeProfileName("   "), "");
+  assert.equal(sanitizeProfileName("../etc"), "");
+  assert.equal(sanitizeProfileName("a/../b"), "");
+  assert.equal(sanitizeProfileName("a/b"), "");
+  assert.equal(sanitizeProfileName("a\b"), "");
+  assert.equal(sanitizeProfileName(".hidden"), "");
+  assert.equal(sanitizeProfileName("x".repeat(65)), "");
 });
