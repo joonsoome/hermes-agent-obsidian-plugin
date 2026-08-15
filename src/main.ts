@@ -1,6 +1,9 @@
 import { FileSystemAdapter, MarkdownView, Notice, Plugin, WorkspaceLeaf, normalizePath } from "obsidian";
+// eslint-disable-next-line import/no-nodejs-modules
 import * as fs from "fs";
+// eslint-disable-next-line import/no-nodejs-modules
 import * as os from "os";
+// eslint-disable-next-line import/no-nodejs-modules
 import * as path from "path";
 import { DEFAULT_SETTINGS, HermesSettings } from "./settings/types";
 import { HermesSettingTab } from "./settings/HermesSettingTab";
@@ -328,7 +331,11 @@ export default class HermesPlugin extends Plugin {
     const homes: string[] = [];
     const configured = (this.settings.hermesHome || "").trim();
     if (configured) homes.push(configured);
-    const env = (process.env.HERMES_HOME || process.env.HERMES_CONFIG_DIR || "").trim();
+    // Ignis may not expose process.env; keep the desktop compatibility path.
+    const processEnv = (window as unknown as {
+      process?: { env?: Record<string, string | undefined> };
+    }).process?.env;
+    const env = (processEnv?.HERMES_HOME || processEnv?.HERMES_CONFIG_DIR || "").trim();
     if (env) homes.push(env);
     try {
       homes.push(path.join(os.homedir(), ".hermes"));

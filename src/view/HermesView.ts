@@ -71,6 +71,7 @@ export class HermesView extends ItemView {
   private includeNoteToggle!: HTMLInputElement;
   private includeSelectionToggle!: HTMLInputElement;
   private statusEl!: HTMLElement;
+  private runningStatus = "";
   private metaModelEl!: HTMLElement;
   private metaThinkingEl!: HTMLElement;
   private metaTokensEl!: HTMLElement;
@@ -196,8 +197,11 @@ export class HermesView extends ItemView {
       else void this.onSend();
     };
 
-    // First tab
+    // Restore the newest saved conversation after a reload. The old behavior
+    // always opened a blank tab, which made persisted conversations look lost.
     this.newTab();
+    const latest = this.getConversations()[0];
+    if (latest) this.restoreConversation(latest.id);
     this.refreshMetaBar();
     // Resolve the real model name / context window from the gateway (async).
     void this.loadResolvedModel();
@@ -322,7 +326,7 @@ export class HermesView extends ItemView {
     const running = !!this.activeTab()?.handle;
     this.sendBtn.setText(running ? "Stop" : "Send");
     this.sendBtn.classList.toggle("is-running", running);
-    this.statusEl.setText(running ? "Hermes is thinking..." : "");
+    this.statusEl.setText(running ? this.runningStatus || "Hermes가 작업 중입니다…" : "");
   }
 
   /**
@@ -630,6 +634,11 @@ export class HermesView extends ItemView {
           this.renderToolEvent(assistant, e);
           this.scrollToBottom(tab);
         },
+        onProgress: (text) => {
+          if (tab.id !== this.activeTabId) return;
+          this.runningStatus = text;
+          this.refreshRunningState();
+        },
         onUsage: (u: UsageInfo) => {
           assistant.usageEl.setText(
             `tokens: ${u.totalTokens} (in ${u.promptTokens} / out ${u.completionTokens})`
@@ -644,6 +653,7 @@ export class HermesView extends ItemView {
           assistant.contentEl.empty();
           assistant.contentEl.createDiv({ cls: "hermes-error", text: msg });
           tab.handle = null;
+          this.runningStatus = "";
           tab.messages.push({ role: "assistant", content: `[error] ${msg}` });
           tab.uiMeta.push(undefined);
           this.refreshRunningState();
@@ -655,6 +665,7 @@ export class HermesView extends ItemView {
           tab.messages.push({ role: "assistant", content: buffer });
           tab.uiMeta.push(undefined);
           tab.handle = null;
+          this.runningStatus = "";
           this.refreshRunningState();
           this.saveTabHistory(tab);
         }
@@ -670,6 +681,7 @@ export class HermesView extends ItemView {
     if (tab?.handle) {
       tab.handle.abort();
       tab.handle = null;
+      this.runningStatus = "";
       this.refreshRunningState();
     }
   }

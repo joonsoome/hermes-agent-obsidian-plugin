@@ -40,6 +40,8 @@ export interface StreamCallbacks {
   onChunk(text: string): void;
   onReasoning?(text: string): void;
   onToolEvent?(event: ToolEvent): void;
+  /** A short, user-facing transport/activity update while a run is pending. */
+  onProgress?(text: string): void;
   onUsage?(usage: UsageInfo): void;
   onError(message: string): void;
   onDone(sessionId?: string): void;
@@ -699,10 +701,22 @@ export class HermesGatewayClient {
     let runId = "";
     let hasContent = false;
     let fellBack = false;
+    let lastActivity = "";
+    const startedAt = Date.now();
+
+    const reportProgress = (activity: string) => {
+      const elapsed = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+      const text = `${activity} (${elapsed}s)`;
+      if (text !== lastActivity) {
+        lastActivity = text;
+        cb.onProgress?.(text);
+      }
+    };
 
     const fallback = () => {
       if (fellBack || isAborted()) return;
       fellBack = true;
+      cb.onProgress?.("실시간 연결을 다시 시도하는 중…");
       this.startChat(input, history, cb, resumeSessionId, reqs, isAborted, finish);
     };
 
@@ -726,6 +740,7 @@ export class HermesGatewayClient {
 
       const poll = () => {
         if (stopped || isAborted()) return;
+        reportProgress("Hermes가 작업 중입니다");
         const statusUrl = `${apiUrl}/v1/runs/${encodeURIComponent(id)}`;
         const statusReq = this.requester().request(
           statusUrl,
@@ -750,6 +765,12 @@ export class HermesGatewayClient {
               }
 
               const state = typeof status.status === "string" ? status.status : "";
+              const lastEvent = typeof status.last_event === "string" ? status.last_event : "";
+              if (state === "queued") reportProgress("작업 대기열을 확인하는 중입니다");
+              else if (state === "waiting_for_approval") reportProgress("도구 권한을 확인하는 중입니다");
+              else if (lastEvent === "reasoning.available") reportProgress("요청을 분석하는 중입니다");
+              else if (lastEvent === "tool.started") reportProgress("도구를 실행하는 중입니다");
+              else if (lastEvent === "tool.completed") reportProgress("도구 작업을 마치고 다음 단계를 진행 중입니다");
               if (state === "completed") {
                 stopPolling();
                 const output = typeof status.output === "string" ? status.output : "";
@@ -799,6 +820,7 @@ export class HermesGatewayClient {
     };
 
     const startUrl = `${apiUrl}/v1/runs`;
+    cb.onProgress?.("Hermes에 요청을 전달하는 중…");
     const startReq = this.requester().request(
       startUrl,
       { method: "POST", headers, timeout: 30000 },
@@ -820,6 +842,7 @@ export class HermesGatewayClient {
             fallback();
             return;
           }
+          cb.onProgress?.("요청을 접수했습니다. 작업 진행 상황을 확인하는 중…");
           pollRun(runId);
         });
       }
