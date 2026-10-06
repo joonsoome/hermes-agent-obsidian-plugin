@@ -10,6 +10,12 @@ export interface HermesSettings {
   /** Model id (e.g. "gpt-5.5"). Empty -> the gateway's "hermes-agent" default. */
   model: string;
   /**
+   * Hermes profile to route requests to on a multiplexing gateway (v0.21+):
+   * all profiles are served on one port and selected via the `/p/<profile>/`
+   * URL prefix. Empty -> the gateway's default profile. This is NOT a model id.
+   */
+  profile: string;
+  /**
    * Which transport to use against the gateway:
    *  - auto: probe /v1/capabilities, prefer the richer Runs transport,
    *          fall back to Chat Completions.
@@ -76,6 +82,7 @@ export const DEFAULT_SETTINGS: HermesSettings = {
   baseUrl: "/hermes",
   apiKey: "",
   model: "",
+  profile: "",
   transport: "auto",
   reasoningEffort: "",
   includeNoteContent: true,

@@ -65,6 +65,28 @@ export class HermesSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Profile")
+      .setDesc(
+        "Hermes profile to chat with. A multiplexing gateway (v0.21+) serves all profiles on one port and routes via /p/<profile>/ — this is not a model id. Leave empty for the gateway default. In browser hosts (Ignis) the folder scan is unavailable; type the name (e.g. researcher) and use Test connection to verify."
+      )
+      .addText((text) => {
+        text
+          .setPlaceholder("(default)")
+          .setValue(this.plugin.settings.profile || "")
+          .onChange((v) => {
+            this.plugin.settings.profile = v.trim();
+            void this.plugin.saveAndReloadProfile();
+          });
+        const known = this.plugin.listHermesProfiles();
+        if (known.length) {
+          const listEl = containerEl.createEl("datalist", { attr: { id: "hermes-profile-names" } });
+          for (const name of known) listEl.createEl("option", { value: name });
+          text.inputEl.setAttribute("list", "hermes-profile-names");
+        }
+        return text;
+      });
+
+    new Setting(containerEl)
       .setName("Model")
       .setDesc('Model id, e.g. "gpt-5.5". Leave empty to show the real model from your Hermes config. Use "Test connection" to list models.')
       .addText((text) =>

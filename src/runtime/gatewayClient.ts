@@ -25,6 +25,7 @@ import {
   normaliseBaseUrl,
   parseSseBlock,
   runCompletedUsage,
+  sanitizeProfileName,
   supportsRunsTransport
 } from "./protocol";
 import { buildSystemInstructions, resolveWorkingFolder } from "./context";
@@ -264,6 +265,16 @@ export class HermesGatewayClient {
     return normaliseBaseUrl(this.getSettings().baseUrl);
   }
 
+  /**
+   * Base including the profile routing prefix. A multiplexing gateway (Hermes
+   * v0.21+) serves every profile on one port and selects it via `/p/<name>/`
+   * URL prefixes; unknown names 404. Empty profile -> no prefix (default).
+   */
+  private profileBase(): string {
+    const name = sanitizeProfileName(this.getSettings().profile || "");
+    return name ? `${this.base()}/p/${name}` : this.base();
+  }
+
   /** Absolute path of the agent's working folder (vault root or configured sub-folder). */
   private workingFolderPath(): string {
     return resolveWorkingFolder(this.getVaultBasePath() || "", this.getSettings().workingFolder || "");
@@ -299,7 +310,7 @@ export class HermesGatewayClient {
     body?: unknown,
     timeoutMs = 8000
   ): Promise<RawResponse> {
-    const url = `${this.base()}${path}`;
+    const url = `${this.profileBase()}${path}`;
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers: Record<string, string> = { ...this.authHeaders() };
     if (payload) {
@@ -567,7 +578,7 @@ export class HermesGatewayClient {
     let sessionId = resumeSessionId || newSessionId();
     if (sessionId) headers["X-Hermes-Session-Id"] = sessionId;
 
-    const url = `${this.base()}/v1/chat/completions`;
+    const url = `${this.profileBase()}/v1/chat/completions`;
     let hasContent = false;
     let lastError = "";
 
@@ -666,7 +677,7 @@ export class HermesGatewayClient {
     finish: (error?: string, sessionId?: string) => void
   ): void {
     const s = this.getSettings();
-    const apiUrl = this.base();
+    const apiUrl = this.profileBase();
     const auth = this.authHeaders();
     const sessionId = resumeSessionId || newSessionId();
 

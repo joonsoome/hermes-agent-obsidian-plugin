@@ -329,6 +329,9 @@ export default class HermesPlugin extends Plugin {
    */
   private hermesHomeCandidates(): string[] {
     const homes: string[] = [];
+    // An explicitly selected profile wins over the active_profile marker so the
+    // footer shows the model of the profile the chat actually runs against.
+    const selectedProfile = sanitizeProfileName(this.settings.profile || "");
     const configured = (this.settings.hermesHome || "").trim();
     if (configured) homes.push(configured);
     // Ignis may not expose process.env; keep the desktop compatibility path.
@@ -347,11 +350,62 @@ export default class HermesPlugin extends Plugin {
     // must win over its parent home or the footer shows a stale model.
     const out: string[] = [];
     for (const home of homes) {
+      if (selectedProfile) {
+        const dir = path.join(home, "profiles", selectedProfile);
+        try {
+          if (fs.existsSync(path.join(dir, "config.yaml"))) {
+            out.push(dir);
+            continue;
+          }
+        } catch {
+          /* fall through to the generic resolution */
+        }
+      }
       const profileDir = this.activeProfileDir(home);
       if (profileDir) out.push(profileDir);
       out.push(home);
     }
     return out;
+  }
+
+  /**
+   * Profile names available on disk under `<home>/profiles` (for the settings
+   * dropdown). Empty when no Hermes home is readable (e.g. a remote gateway).
+   */
+  listHermesProfiles(): string[] {
+    const names = new Set<string>();
+    for (const home of this.rawHomes()) {
+      try {
+        const dir = path.join(home, "profiles");
+        if (!fs.existsSync(dir)) continue;
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (entry.isDirectory() && fs.existsSync(path.join(dir, entry.name, "config.yaml"))) {
+            names.add(entry.name);
+          }
+        }
+      } catch {
+        /* unreadable home — ignore */
+      }
+    }
+    return Array.from(names).sort();
+  }
+
+  /** Candidate Hermes homes without profile-dir resolution (configured override first). */
+  private rawHomes(): string[] {
+    const homes: string[] = [];
+    const configured = (this.settings.hermesHome || "").trim();
+    if (configured) homes.push(configured);
+    const processEnv = (window as unknown as {
+      process?: { env?: Record<string, string | undefined> };
+    }).process?.env;
+    const env = (processEnv?.HERMES_HOME || processEnv?.HERMES_CONFIG_DIR || "").trim();
+    if (env) homes.push(env);
+    try {
+      homes.push(path.join(os.homedir(), ".hermes"));
+    } catch {
+      /* ignore */
+    }
+    return homes;
   }
 
   /**
@@ -408,6 +462,12 @@ export default class HermesPlugin extends Plugin {
       const view = leaf.view;
       if (view instanceof HermesView) view.refreshMetaBar();
     }
+  }
+
+  /** Persist settings after a profile change, then refresh view footers. */
+  async saveAndReloadProfile(): Promise<void> {
+    await this.saveSettings();
+    this.reloadModelInViews();
   }
 
   /** Re-resolve the active model (after a model/URL/key change) in open views. */
